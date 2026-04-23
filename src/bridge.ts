@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from "node:child_process";
+import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { createConnection, Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -27,9 +27,39 @@ function resolveBlender(): string {
 
 const BLENDER_EXE = resolveBlender();
 const BRIDGE_PY = resolve(__dirname, "..", "blender", "server.py");
-const PORT = parseInt(process.env.BLENDER_MCP_PORT ?? "54321", 10);
-const STARTUP_TIMEOUT_MS = parseInt(process.env.BLENDER_STARTUP_TIMEOUT ?? "60000", 10);
-const REQUEST_TIMEOUT_MS = parseInt(process.env.BLENDER_REQUEST_TIMEOUT ?? "120000", 10);
+
+function parsePort(v: string | undefined, def: number): number {
+  const raw = v ?? String(def);
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0 || n > 65535) {
+    throw new Error(`invalid BLENDER_MCP_PORT: "${raw}" (must be 1..65535)`);
+  }
+  return n;
+}
+
+function parsePosInt(v: string | undefined, def: number, name: string): number {
+  const raw = v ?? String(def);
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`invalid ${name}: "${raw}"`);
+  }
+  return n;
+}
+
+const PORT = parsePort(process.env.BLENDER_MCP_PORT, 54321);
+const STARTUP_TIMEOUT_MS = parsePosInt(process.env.BLENDER_STARTUP_TIMEOUT, 60000, "BLENDER_STARTUP_TIMEOUT");
+const REQUEST_TIMEOUT_MS = parsePosInt(process.env.BLENDER_REQUEST_TIMEOUT, 120000, "BLENDER_REQUEST_TIMEOUT");
+
+function killProc(proc: ChildProcess): void {
+  if (!proc.pid) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "ignore" });
+      return;
+    } catch {}
+  }
+  try { proc.kill("SIGKILL"); } catch {}
+}
 
 type Pending = {
   id: number;
@@ -113,12 +143,18 @@ export class BlenderBridge {
     });
     this.sock.setKeepAlive(true);
     this.sock.on("data", (chunk) => this.onData(chunk));
-    this.sock.on("error", (e) => {
+    const onDisconnect = (e: Error) => {
       for (const p of this.pending.values()) {
         clearTimeout(p.timer);
         p.reject(e);
       }
       this.pending.clear();
+      this.sock = undefined;
+      this.readyPromise = undefined;
+    };
+    this.sock.on("error", onDisconnect);
+    this.sock.on("close", (hadError) => {
+      if (this.sock) onDisconnect(new Error(`blender socket closed${hadError ? " with error" : ""}`));
     });
   }
 
@@ -169,7 +205,7 @@ export class BlenderBridge {
 
   shutdown() {
     try { this.sock?.end(); } catch {}
-    try { this.proc?.kill(); } catch {}
+    try { if (this.proc) killProc(this.proc); } catch {}
   }
 }
 
