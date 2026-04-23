@@ -43,6 +43,15 @@
 | `import_file` / `export_file` | `.obj` / `.fbx` / `.glb` / `.gltf` / `.stl` / `.ply`（`.dae` は import のみ） |
 | `open` / `save` | `.blend` ファイルの読み込み / 保存 |
 | `reset` | ファクトリリセット（空シーン） |
+| `keyframe_insert` | 任意プロパティ (location / rotation_euler / scale / hide_* / 他 attr) にキーフレーム挿入。`value` で値を事前設定、`interpolation` で補間種別 (CONSTANT / LINEAR / BEZIER / SINE / QUAD / CUBIC / EXPO / CIRC / BACK / BOUNCE / ELASTIC 等) 指定可 |
+| `keyframe_delete` | 特定 `frame` またはプロパティ全体のキーフレーム削除 |
+| `list_keyframes` | fcurves と各 keyframe_points (frame / value / interpolation) を列挙 |
+| `set_frame` | シーン現在フレームを設定 |
+| `frame_range` | `scene.frame_start` / `frame_end` / `render.fps` を一括設定 |
+| `add_modifier` | BEVEL / SUBSURF / ARRAY / SOLIDIFY / MIRROR / BOOLEAN / DECIMATE / WAVE / ... を追加、`params` dict でアトリビュート設定、未知 params は `unknown_params` に収集して返却 |
+| `remove_modifier` | `modifier_name` で削除 |
+| `list_modifiers` | modifier 一覧 + 主要 attr (levels / render_levels / count / width / segments / thickness / factor / angle / axis / offset / operation / solver) を抽出 |
+| `camera_look_at` | カメラに Track To constraint を張って target を見続けるように |
 
 ## 処理フロー
 
@@ -100,6 +109,31 @@ claude mcp add blender -- node C:/Users/user/Desktop/blender-mcp/dist/index.js
 {"action": "create", "primitive": "cube", "name": "Hero", "location": [0, 0, 1]}
 {"action": "material", "object": "Hero", "color": [0.8, 0.2, 0.2], "metallic": 0.3, "roughness": 0.4}
 {"action": "render", "output_path": "C:/tmp/out.png", "resolution_x": 1920, "resolution_y": 1080, "samples": 64, "engine": "CYCLES"}
+```
+
+キーフレームアニメーション (1 秒で真上に 5m 上昇):
+
+```json
+{"action": "frame_range", "start": 1, "end": 24, "fps": 24}
+{"action": "keyframe_insert", "object": "A", "property": "location",
+ "frame": 1, "value": [0, 0, 0]}
+{"action": "keyframe_insert", "object": "A", "property": "location",
+ "frame": 24, "value": [0, 0, 5], "interpolation": "LINEAR"}
+```
+
+モディファイア追加 (SUBSURF レベル 2 + BEVEL 幅 0.1):
+
+```json
+{"action": "add_modifier", "object": "A", "modifier_type": "SUBSURF",
+ "params": {"levels": 2, "render_levels": 3}}
+{"action": "add_modifier", "object": "A", "modifier_type": "BEVEL",
+ "name": "edge_bevel", "params": {"width": 0.1, "segments": 3}}
+```
+
+カメラを追従ターゲットに向ける (Track To constraint):
+
+```json
+{"action": "camera_look_at", "camera": "Cam", "target": "Suzanne"}
 ```
 
 宣言的アクションでカバーできない操作は `execute` に落とす:
