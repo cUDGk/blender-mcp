@@ -160,3 +160,7 @@ claude mcp add blender -- node C:/Users/user/Desktop/blender-mcp/dist/index.js
 ## ライセンス
 
 MIT License © 2026 cUDGk — 詳細は [LICENSE](LICENSE) を参照。
+
+## v0.2.1 修正
+
+Claude Code の LLM ツール呼び出しパスで、object / array 型の引数が JSON 文字列化された状態で届く事があるバグに対応。文字列で受け取っても `coerceObject()` ヘルパで解釈し直すようにし、zod schema は `z.union([<本来>, z.string()])` に緩和した。正常な object / array 経路は従来通り動作する。
