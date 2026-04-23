@@ -1,6 +1,6 @@
 {
   "name": "blender-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP stdio server wrapping Blender's Python API — persistent headless Blender with structured scene-graph access",
   "type": "module",
   "main": "dist/index.js",

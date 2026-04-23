@@ -275,6 +275,149 @@ def _select(names=None, all_=False, none=False):
     return {"selected": [o.name for o in bpy.context.selected_objects]}
 
 
+def _keyframe_insert(object_name: str, property: str, frame: int, value=None, interpolation=None):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    if value is not None:
+        if property == "location":
+            obj.location = tuple(value)
+        elif property == "rotation_euler":
+            obj.rotation_euler = tuple(value)
+        elif property == "scale":
+            obj.scale = tuple(value)
+        elif property == "hide_viewport" or property == "hide_render":
+            setattr(obj, property, bool(value))
+        else:
+            # attribute-style path on the object
+            if not hasattr(obj, property):
+                raise ValueError(f"object has no property '{property}'")
+            setattr(obj, property, value)
+    bpy.context.scene.frame_set(int(frame))
+    obj.keyframe_insert(data_path=property, frame=int(frame))
+    # set interpolation on the last keyframe
+    if interpolation and obj.animation_data and obj.animation_data.action:
+        for fc in obj.animation_data.action.fcurves:
+            if fc.data_path == property:
+                if fc.keyframe_points:
+                    fc.keyframe_points[-1].interpolation = interpolation.upper()
+    return {"object": object_name, "property": property, "frame": int(frame)}
+
+
+def _keyframe_delete(object_name: str, property: str, frame=None):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    if frame is None:
+        obj.keyframe_delete(data_path=property)
+    else:
+        obj.keyframe_delete(data_path=property, frame=int(frame))
+    return {"object": object_name, "property": property, "frame": frame}
+
+
+def _list_keyframes(object_name: str):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    out = []
+    if obj.animation_data and obj.animation_data.action:
+        for fc in obj.animation_data.action.fcurves:
+            kps = [{"frame": kp.co[0], "value": kp.co[1], "interpolation": kp.interpolation}
+                   for kp in fc.keyframe_points]
+            out.append({"data_path": fc.data_path, "array_index": fc.array_index, "keyframes": kps})
+    return {"object": object_name, "fcurves": out}
+
+
+def _set_frame(frame: int):
+    bpy.context.scene.frame_set(int(frame))
+    return {"frame": int(frame)}
+
+
+def _frame_range(start: int, end: int, fps=None):
+    sc = bpy.context.scene
+    sc.frame_start = int(start)
+    sc.frame_end = int(end)
+    if fps is not None:
+        sc.render.fps = int(fps)
+    return {"frame_start": sc.frame_start, "frame_end": sc.frame_end, "fps": sc.render.fps}
+
+
+def _add_modifier(object_name: str, mod_type: str, name=None, params=None):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    if not hasattr(obj, "modifiers"):
+        raise ValueError(f"object {object_name} does not support modifiers")
+    mod = obj.modifiers.new(name=name or mod_type.capitalize(), type=mod_type.upper())
+    unknown = []
+    if params:
+        for k, v in params.items():
+            if not hasattr(mod, k):
+                unknown.append(k)
+                continue
+            setattr(mod, k, v)
+    return {
+        "object": object_name,
+        "name": mod.name,
+        "type": mod.type,
+        "unknown_params": unknown,
+    }
+
+
+def _remove_modifier(object_name: str, modifier_name: str):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(f"modifier not found: {modifier_name} on {object_name}")
+    obj.modifiers.remove(mod)
+    return {"object": object_name, "removed": modifier_name}
+
+
+def _list_modifiers(object_name: str):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"object not found: {object_name}")
+    mods = []
+    for m in obj.modifiers:
+        d = {"name": m.name, "type": m.type}
+        # Common exposed params — skip RNA internals
+        for attr in ("levels", "render_levels", "count", "width", "segments",
+                     "thickness", "factor", "angle", "axis", "offset",
+                     "use_mirror_u", "use_mirror_v", "operation", "solver"):
+            if hasattr(m, attr):
+                try:
+                    v = getattr(m, attr)
+                    if hasattr(v, "__iter__") and not isinstance(v, str):
+                        v = list(v)
+                    d[attr] = v
+                except Exception:
+                    pass
+        mods.append(d)
+    return {"object": object_name, "modifiers": mods}
+
+
+def _camera_look_at(camera_name: str, target_name: str, track_axis="TRACK_NEGATIVE_Z", up_axis="UP_Y"):
+    cam = bpy.data.objects.get(camera_name)
+    if cam is None:
+        raise ValueError(f"camera not found: {camera_name}")
+    if cam.type != "CAMERA":
+        raise ValueError(f"{camera_name} is not a CAMERA (type={cam.type})")
+    target = bpy.data.objects.get(target_name)
+    if target is None:
+        raise ValueError(f"target not found: {target_name}")
+    # Remove any existing TRACK_TO constraint
+    for c in list(cam.constraints):
+        if c.type == "TRACK_TO":
+            cam.constraints.remove(c)
+    cons = cam.constraints.new(type="TRACK_TO")
+    cons.target = target
+    cons.track_axis = track_axis
+    cons.up_axis = up_axis
+    return {"camera": camera_name, "target": target_name, "track_axis": track_axis, "up_axis": up_axis}
+
+
 def _material(object_name: str, name=None, color=None, metallic=None, roughness=None):
     obj = bpy.data.objects.get(object_name)
     if obj is None:
@@ -327,6 +470,17 @@ HANDLERS = {
     "material": lambda p: _material(
         p["object"], p.get("name"), p.get("color"), p.get("metallic"), p.get("roughness")
     ),
+    "keyframe_insert": lambda p: _keyframe_insert(
+        p["object"], p["property"], p["frame"], p.get("value"), p.get("interpolation"),
+    ),
+    "keyframe_delete": lambda p: _keyframe_delete(p["object"], p["property"], p.get("frame")),
+    "list_keyframes": lambda p: _list_keyframes(p["object"]),
+    "set_frame": lambda p: _set_frame(p["frame"]),
+    "frame_range": lambda p: _frame_range(p["start"], p["end"], p.get("fps")),
+    "add_modifier": lambda p: _add_modifier(p["object"], p["modifier_type"], p.get("name"), p.get("params")),
+    "remove_modifier": lambda p: _remove_modifier(p["object"], p["modifier_name"]),
+    "list_modifiers": lambda p: _list_modifiers(p["object"]),
+    "camera_look_at": lambda p: _camera_look_at(p["camera"], p["target"], p.get("track_axis", "TRACK_NEGATIVE_Z"), p.get("up_axis", "UP_Y")),
 }
 
 
