@@ -2,12 +2,42 @@ import { spawn, execFileSync, ChildProcess } from "node:child_process";
 import { createConnection, Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+function discoverWindowsBlenderInstalls(): string[] {
+  const out: string[] = [];
+  const roots = [
+    "C:/Program Files/Blender Foundation",
+    "C:/Program Files (x86)/Blender Foundation",
+  ];
+  for (const root of roots) {
+    if (!existsSync(root)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(root);
+    } catch {
+      continue;
+    }
+    // Sort descending so newer versions win.
+    entries.sort().reverse();
+    for (const e of entries) {
+      if (!e.toLowerCase().startsWith("blender ")) continue;
+      const exe = `${root}/${e}/blender.exe`;
+      if (existsSync(exe)) out.push(exe);
+    }
+  }
+  return out;
+}
+
 const CANDIDATES = [
   process.env.BLENDER_PATH,
+  ...discoverWindowsBlenderInstalls(),
+  // Fallbacks for known versions (sorted newest-first) in case discovery missed.
+  "C:/Program Files/Blender Foundation/Blender 5.0/blender.exe",
+  "C:/Program Files/Blender Foundation/Blender 4.5/blender.exe",
   "C:/Program Files/Blender Foundation/Blender 4.4/blender.exe",
   "C:/Program Files/Blender Foundation/Blender 4.3/blender.exe",
   "C:/Program Files/Blender Foundation/Blender 4.2/blender.exe",
@@ -49,6 +79,10 @@ function parsePosInt(v: string | undefined, def: number, name: string): number {
 const PORT = parsePort(process.env.BLENDER_MCP_PORT, 54321);
 const STARTUP_TIMEOUT_MS = parsePosInt(process.env.BLENDER_STARTUP_TIMEOUT, 60000, "BLENDER_STARTUP_TIMEOUT");
 const REQUEST_TIMEOUT_MS = parsePosInt(process.env.BLENDER_REQUEST_TIMEOUT, 120000, "BLENDER_REQUEST_TIMEOUT");
+// Per-launch shared secret. Any local process can connect to the loopback
+// socket; without this, that means RCE via `execute`. Server.py reads the
+// same env var and rejects unauthenticated requests.
+const TOKEN = randomBytes(32).toString("hex");
 
 function killProc(proc: ChildProcess): void {
   if (!proc.pid) return;

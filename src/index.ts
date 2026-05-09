@@ -20,20 +20,48 @@ function errContent(err: unknown) {
  * 文字列で届いた場合は JSON.parse してから返す。
  * 既に object / array ならそのまま。undefined/null はそのまま undefined。
  */
-function coerceObject<T>(v: unknown): T | undefined {
+function coerceObject<T>(v: unknown, key: string): T | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v === "string") {
     const s = v.trim();
     if (!s) return undefined;
     try {
       return JSON.parse(s) as T;
-    } catch {
-      // parse 失敗時は undefined にせず、元の文字列を落とすのは呼び出し側責任
-      return undefined;
+    } catch (err) {
+      // Surface parse errors; silently dropping the value made the LLM
+      // think its array argument went through and then watch the action
+      // fail with a confusing missing-field error downstream.
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid JSON for parameter '${key}': ${msg}`);
     }
   }
   return v as T;
 }
+
+const ALLOW_EXECUTE = process.env.BLENDER_MCP_ALLOW_EXECUTE === "1";
+
+// Per-action required-parameter map. Validation fires before reaching the
+// bridge so the model gets an actionable error instead of a Python
+// KeyError relayed across the wire.
+const REQUIRED: Record<string, readonly string[]> = {
+  render: ["output_path"],
+  create: ["primitive"],
+  delete: ["name"],
+  transform: ["name"],
+  material: ["object"],
+  import_file: ["path"],
+  export_file: ["path"],
+  open: ["path"],
+  keyframe_insert: ["object", "property", "frame"],
+  keyframe_delete: ["object", "property"],
+  list_keyframes: ["object"],
+  set_frame: ["frame"],
+  frame_range: ["start", "end"],
+  add_modifier: ["object", "modifier_type"],
+  remove_modifier: ["object", "modifier_name"],
+  list_modifiers: ["object"],
+  camera_look_at: ["camera", "target"],
+};
 
 // 本来の型 + 文字列化版 も受け入れる。LLM には第一候補 (array/object) が
 // 表示されるが、実行時に coerceObject で戻す。
@@ -161,6 +189,31 @@ Use 'scene' first to inspect state, then combine declarative actions (create/tra
             // parse できなければ元の文字列のまま (スカラー文字列として意味がある場合もある)
           }
         }
+      }
+      // add_modifier consumed `name` for the new modifier name, but the
+      // schema now uses a separate field so it doesn't collide with the
+      // object/material `name`. Translate before sending — but only when
+      // `name` itself isn't already set, otherwise we silently overwrite
+      // the LLM's explicit choice.
+      if (action === "add_modifier" && "modifier_name_new" in normalized) {
+        if (!normalized.name) {
+          normalized.name = normalized.modifier_name_new;
+        }
+        delete normalized.modifier_name_new;
+      }
+      // Per-action required-arg validation. Done after coercion because a
+      // string-encoded array still satisfies the "is present" check.
+      const required = REQUIRED[action];
+      if (required) {
+        for (const r of required) {
+          if (!(r in normalized) || normalized[r] === undefined || normalized[r] === null
+              || (typeof normalized[r] === "string" && (normalized[r] as string).length === 0)) {
+            return errContent(`${action} requires ${r}`);
+          }
+        }
+      }
+      if (action === "execute" && (!("code" in normalized) || !normalized.code)) {
+        return errContent("execute requires code");
       }
       const result = await bridge.send(action, normalized);
       return textContent(result);

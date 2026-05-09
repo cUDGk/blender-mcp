@@ -11,10 +11,12 @@ MCP server restarts.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import io
 import json
 import math
 import os
+import re
 import socket
 import sys
 import traceback
@@ -24,6 +26,43 @@ import bpy  # type: ignore
 
 PORT = int(os.environ.get("BLENDER_MCP_PORT", "54321"))
 HOST = "127.0.0.1"
+# Per-launch shared secret. The bridge generates this and passes it via env
+# on every Blender spawn; we reject any client that doesn't echo it back.
+# Loopback alone is not authentication on a multi-user host.
+TOKEN = os.environ.get("BLENDER_MCP_TOKEN")
+DEBUG = os.environ.get("BLENDER_MCP_DEBUG") == "1"
+# Workspace root for path-taking handlers. Defaults to cwd, but can be set
+# explicitly via env. _safe() refuses to read/write outside this tree.
+WORKSPACE = os.path.realpath(
+    os.environ.get("BLENDER_MCP_WORKSPACE") or os.getcwd()
+)
+# Default-deny attribute name pattern for setattr-from-LLM-input paths.
+# Blocks dunders, private names, anything that doesn't look like a normal
+# Python identifier we'd expect on a Blender RNA struct.
+_SAFE_ATTR_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# keyframe_insert data_path also accepts indexed forms like color[0].
+_SAFE_DATAPATH_RE = re.compile(r"^[a-z][a-z0-9_]*(\[[0-9]+\])?$")
+
+
+def _safe(path: str) -> str:
+    """Resolve `path` and require it to live under WORKSPACE. Returns realpath."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
+    # Null bytes pass os.path.commonpath on Windows (since realpath doesn't
+    # strip them), but the Win32 CreateFile API truncates at the first NUL.
+    # A path like "workspace/foo\x00.png" appears to be inside the workspace
+    # while actually opening "workspace/foo". Reject early.
+    if "\x00" in path:
+        raise ValueError("path must not contain null bytes")
+    p = os.path.realpath(os.path.abspath(path))
+    try:
+        common = os.path.commonpath([p, WORKSPACE])
+    except ValueError:
+        # Different drives on Windows — definitely not inside WORKSPACE.
+        raise ValueError(f"path outside workspace: {path}")
+    if common != WORKSPACE:
+        raise ValueError(f"path outside workspace: {path}")
+    return p
 
 
 def _scene():
@@ -140,13 +179,13 @@ def _render(output_path: str, resolution_x=None, resolution_y=None,
         scene.camera = cam
     if frame is not None:
         scene.frame_set(int(frame))
-    scene.render.filepath = os.path.abspath(output_path)
+    scene.render.filepath = _safe(output_path)
     bpy.ops.render.render(write_still=True)
     return {"path": scene.render.filepath, "engine": scene.render.engine}
 
 
 def _import_file(path: str):
-    path = os.path.abspath(path)
+    path = _safe(path)
     ext = os.path.splitext(path)[1].lower()
     before = {o.name for o in bpy.data.objects}
     if ext == ".obj":
@@ -174,7 +213,7 @@ def _import_file(path: str):
 
 
 def _export_file(path: str, selection_only: bool = False):
-    path = os.path.abspath(path)
+    path = _safe(path)
     ext = os.path.splitext(path)[1].lower()
     if ext == ".obj":
         kw = {"filepath": path}
@@ -219,14 +258,18 @@ def _export_file(path: str, selection_only: bool = False):
 
 
 def _open_file(path: str):
-    path = os.path.abspath(path)
-    bpy.ops.wm.open_mainfile(filepath=path)
+    path = _safe(path)
+    # use_scripts=False blocks any auto-run Python embedded in the .blend file.
+    # Without this, opening an attacker-controlled .blend executes arbitrary
+    # Python in our Blender process even though we ran with --disable-autoexec
+    # (which only sets the user pref).
+    bpy.ops.wm.open_mainfile(filepath=path, use_scripts=False)
     return {"path": path}
 
 
 def _save_file(path=None):
     if path:
-        path = os.path.abspath(path)
+        path = _safe(path)
         bpy.ops.wm.save_as_mainfile(filepath=path)
     else:
         if not bpy.data.filepath:
@@ -236,16 +279,37 @@ def _save_file(path=None):
 
 
 def _reset():
-    bpy.ops.wm.read_factory_settings(use_empty=False)
+    # use_empty=True matches the documented "空シーン" behavior — the
+    # default-cube startup file is not what callers ask for when they
+    # request a reset.
+    bpy.ops.wm.read_factory_settings(use_empty=True)
     return {"ok": True}
 
 
 def _execute(code: str):
     buf = io.StringIO()
     err_buf = io.StringIO()
-    ns = {"bpy": bpy, "math": math, "os": os, "_result": None}
+    # `os` deliberately not pre-imported. The model can `import os` if it
+    # actually needs it; making it a default reduces the friction for
+    # hostile/path-touching one-liners.
+    ns = {"bpy": bpy, "math": math, "_result": None}
+    exc_text = None
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err_buf):
-        exec(code, ns)
+        try:
+            # Single-dict form: globals==locals so user code can declare
+            # `global _result` if it assigns from inside a function. The
+            # 2-arg form (or passing a separate locals dict) makes the
+            # top-level assignment land in `locals` while `global _result`
+            # binds against `globals`, and the value gets lost.
+            exec(code, ns)
+        except Exception:
+            exc_text = traceback.format_exc()
+    if exc_text is not None:
+        # Preserve captured stdout/stderr; with raise-only the LLM loses
+        # the print() output it added for debugging.
+        raise RuntimeError(
+            f"execute failed:\nstdout:\n{buf.getvalue()}\nstderr:\n{err_buf.getvalue()}\n{exc_text}"
+        )
     result = ns.get("_result")
     try:
         json.dumps(result)
@@ -279,6 +343,11 @@ def _keyframe_insert(object_name: str, property: str, frame: int, value=None, in
     obj = bpy.data.objects.get(object_name)
     if obj is None:
         raise ValueError(f"object not found: {object_name}")
+    # Default-deny on data_path: anything not matching the safe pattern
+    # (lowercase identifier, optional [int] index) is rejected so an LLM
+    # can't reach `__class__` or RNA escape hatches via this path.
+    if not isinstance(property, str) or not _SAFE_DATAPATH_RE.match(property):
+        raise ValueError(f"invalid property name: {property!r}")
     if value is not None:
         if property == "location":
             obj.location = tuple(value)
@@ -308,6 +377,10 @@ def _keyframe_delete(object_name: str, property: str, frame=None):
     obj = bpy.data.objects.get(object_name)
     if obj is None:
         raise ValueError(f"object not found: {object_name}")
+    # Same default-deny validation as _keyframe_insert — data_path must not
+    # contain dunders or escape hatches.
+    if not isinstance(property, str) or not _SAFE_DATAPATH_RE.match(property):
+        raise ValueError(f"invalid property name: {property!r}")
     if frame is None:
         obj.keyframe_delete(data_path=property)
     else:
@@ -348,20 +421,45 @@ def _add_modifier(object_name: str, mod_type: str, name=None, params=None):
         raise ValueError(f"object not found: {object_name}")
     if not hasattr(obj, "modifiers"):
         raise ValueError(f"object {object_name} does not support modifiers")
-    mod = obj.modifiers.new(name=name or mod_type.capitalize(), type=mod_type.upper())
+    # Guard before .upper() / .capitalize() to give a clear error instead of
+    # Blender's opaque RNA enum rejection for an empty-string type.
+    if not isinstance(mod_type, str) or not mod_type.strip():
+        raise ValueError("modifier_type must be a non-empty string")
+    mod_type = mod_type.strip().upper()
+    # Pull the actual enum from RNA so we surface a useful error (and the
+    # full valid set) instead of letting bpy raise its terse RuntimeError.
+    valid_mod_types = {
+        m.identifier
+        for m in bpy.types.Modifier.bl_rna.properties["type"].enum_items
+    }
+    if mod_type not in valid_mod_types:
+        raise ValueError(
+            f"unknown modifier type: {mod_type!r}. Valid: {sorted(valid_mod_types)}"
+        )
+    mod = obj.modifiers.new(name=name or mod_type.capitalize(), type=mod_type)
     unknown = []
+    rejected = []
     if params:
         for k, v in params.items():
+            # Default-deny: only allow lowercase identifier-shaped keys.
+            # `hasattr(mod, "__class__")` is True, so without this filter
+            # the LLM could overwrite class/dict and escape the sandbox.
+            if not isinstance(k, str) or not _SAFE_ATTR_RE.match(k):
+                rejected.append(k)
+                continue
             if not hasattr(mod, k):
                 unknown.append(k)
                 continue
             setattr(mod, k, v)
-    return {
+    out = {
         "object": object_name,
         "name": mod.name,
         "type": mod.type,
         "unknown_params": unknown,
     }
+    if rejected:
+        out["rejected_params"] = rejected
+    return out
 
 
 def _remove_modifier(object_name: str, modifier_name: str):
@@ -398,6 +496,13 @@ def _list_modifiers(object_name: str):
     return {"object": object_name, "modifiers": mods}
 
 
+_VALID_TRACK_AXIS = {
+    "TRACK_X", "TRACK_Y", "TRACK_Z",
+    "TRACK_NEGATIVE_X", "TRACK_NEGATIVE_Y", "TRACK_NEGATIVE_Z",
+}
+_VALID_UP_AXIS = {"UP_X", "UP_Y", "UP_Z"}
+
+
 def _camera_look_at(camera_name: str, target_name: str, track_axis="TRACK_NEGATIVE_Z", up_axis="UP_Y"):
     cam = bpy.data.objects.get(camera_name)
     if cam is None:
@@ -407,6 +512,17 @@ def _camera_look_at(camera_name: str, target_name: str, track_axis="TRACK_NEGATI
     target = bpy.data.objects.get(target_name)
     if target is None:
         raise ValueError(f"target not found: {target_name}")
+    # Validate before bpy raises a terse RNA enum error. Defense-in-depth
+    # against an LLM that bypasses the zod enum (or a future client that
+    # doesn't enforce schemas).
+    if track_axis not in _VALID_TRACK_AXIS:
+        raise ValueError(
+            f"invalid track_axis: {track_axis!r}. Valid: {sorted(_VALID_TRACK_AXIS)}"
+        )
+    if up_axis not in _VALID_UP_AXIS:
+        raise ValueError(
+            f"invalid up_axis: {up_axis!r}. Valid: {sorted(_VALID_UP_AXIS)}"
+        )
     # Remove any existing TRACK_TO constraint
     for c in list(cam.constraints):
         if c.type == "TRACK_TO":
@@ -484,6 +600,9 @@ HANDLERS = {
 }
 
 
+_MAX_REQ_BYTES = 64 * 1024 * 1024
+
+
 def _serve_connection(conn: socket.socket) -> None:
     buf = b""
     while True:
@@ -491,6 +610,10 @@ def _serve_connection(conn: socket.socket) -> None:
         if not chunk:
             return
         buf += chunk
+        # Reject pathological clients that never send a newline; without
+        # this they could OOM the Blender process.
+        if len(buf) > _MAX_REQ_BYTES:
+            raise ValueError("request line too large")
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.strip()
@@ -498,11 +621,25 @@ def _serve_connection(conn: socket.socket) -> None:
                 continue
             try:
                 req = json.loads(line.decode("utf-8"))
-            except Exception as e:
-                resp = {"id": None, "ok": False, "error": f"invalid json: {e}"}
+            except Exception:
+                # Don't echo the exception message — Python's JSONDecodeError
+                # repr includes a snippet of the offending input, which can
+                # leak token / path / arbitrary bytes back to whatever
+                # process spoke to us before auth.
+                resp = {"id": None, "ok": False, "error": "invalid json"}
                 conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
                 continue
             rid = req.get("id")
+            # Auth before dispatch. Loopback isn't a security boundary on a
+            # multi-user host; without this any local process can RCE us
+            # via `execute`. compare_digest avoids timing leaks on the
+            # token comparison.
+            if TOKEN is not None and not hmac.compare_digest(
+                str(req.get("token", "")), TOKEN
+            ):
+                resp = {"id": rid, "ok": False, "error": "auth"}
+                conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+                continue
             action = req.get("action")
             params = req.get("params") or {}
             handler = HANDLERS.get(action)
@@ -512,27 +649,44 @@ def _serve_connection(conn: socket.socket) -> None:
                 result = handler(params)
                 resp = {"id": rid, "ok": True, "result": result}
             except Exception as e:
+                # Tracebacks include host paths; only ship them when the
+                # operator opts in via env var.
                 resp = {
                     "id": rid,
                     "ok": False,
                     "error": f"{type(e).__name__}: {e}",
-                    "traceback": traceback.format_exc(),
                 }
+                if DEBUG:
+                    resp["traceback"] = traceback.format_exc()
             conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
 
 
 def main():
+    # Refuse to expose RCE on loopback if the bridge forgot the token.
+    # Bail out *before* binding the port so we never advertise a service
+    # that would accept unauthenticated requests, even for the brief
+    # window between bind() and the token check.
+    if TOKEN is None:
+        print(
+            "BLENDER_MCP_FATAL: BLENDER_MCP_TOKEN env var is required",
+            flush=True,
+            file=sys.stderr,
+        )
+        sys.exit(2)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((HOST, PORT))
-    sock.listen(1)
+    sock.listen(5)
     print(f"BLENDER_MCP_READY port={PORT}", flush=True)
     try:
         while True:
             conn, _ = sock.accept()
             try:
                 _serve_connection(conn)
-            except (ConnectionResetError, BrokenPipeError):
+            # socket.timeout subclasses OSError in 3.10+; the original
+            # tuple of (ConnectionResetError, BrokenPipeError) misses
+            # plenty of normal disconnects (e.g. EHOSTUNREACH, ETIMEDOUT).
+            except (OSError, ConnectionError):
                 pass
             finally:
                 conn.close()
@@ -540,4 +694,5 @@ def main():
         sock.close()
 
 
-main()
+if __name__ == "__main__":
+    main()
