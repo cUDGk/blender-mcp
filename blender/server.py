@@ -160,11 +160,15 @@ def _render(output_path: str, resolution_x=None, resolution_y=None,
     scene = bpy.context.scene
     if engine:
         scene.render.engine = engine
-    if resolution_x:
+    # `if x:` skips when x == 0; for these numeric fields we want the
+    # explicit-None-means-unchanged semantics. (resolution_x=0 still gets
+    # rejected by Blender below, but the user gets a clear error from
+    # bpy instead of a silent no-op.)
+    if resolution_x is not None:
         scene.render.resolution_x = int(resolution_x)
-    if resolution_y:
+    if resolution_y is not None:
         scene.render.resolution_y = int(resolution_y)
-    if samples:
+    if samples is not None:
         if scene.render.engine == "CYCLES":
             scene.cycles.samples = int(samples)
         else:
@@ -358,18 +362,32 @@ def _keyframe_insert(object_name: str, property: str, frame: int, value=None, in
         elif property == "hide_viewport" or property == "hide_render":
             setattr(obj, property, bool(value))
         else:
-            # attribute-style path on the object
-            if not hasattr(obj, property):
+            # attribute-style path on the object — base name (strip any [idx])
+            base = property.split("[", 1)[0]
+            if not hasattr(obj, base):
                 raise ValueError(f"object has no property '{property}'")
-            setattr(obj, property, value)
+            # The vector-shaped properties (location/rotation_euler/scale)
+            # are handled above. The fallback only handles scalar-shaped
+            # RNA fields — accepting dict / arbitrary objects here would
+            # let an LLM blow up with a confusing RNA TypeError, or worse
+            # set something the safe-attr regex didn't anticipate.
+            if not isinstance(value, (int, float, bool, str)):
+                raise ValueError(
+                    f"value for '{property}' must be a scalar (int/float/bool/str); got {type(value).__name__}"
+                )
+            setattr(obj, base, value)
     bpy.context.scene.frame_set(int(frame))
     obj.keyframe_insert(data_path=property, frame=int(frame))
-    # set interpolation on the last keyframe
+    # Set interpolation on the keyframe at this frame. Using [-1] picks the
+    # most-recently-appended point, which is wrong if frames were inserted
+    # out of order.
     if interpolation and obj.animation_data and obj.animation_data.action:
+        target_frame = int(frame)
         for fc in obj.animation_data.action.fcurves:
             if fc.data_path == property:
-                if fc.keyframe_points:
-                    fc.keyframe_points[-1].interpolation = interpolation.upper()
+                for kp in fc.keyframe_points:
+                    if int(kp.co[0]) == target_frame:
+                        kp.interpolation = interpolation.upper()
     return {"object": object_name, "property": property, "frame": int(frame)}
 
 

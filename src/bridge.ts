@@ -123,20 +123,33 @@ export class BlenderBridge {
   private async launch(): Promise<void> {
     this.proc = spawn(
       BLENDER_EXE,
-      ["--background", "--python", BRIDGE_PY],
+      // --disable-autoexec disables auto-running of Python scripts embedded
+      // in any .blend file we open. Combined with use_scripts=False on
+      // wm.open_mainfile this closes the .blend RCE vector.
+      ["--disable-autoexec", "--background", "--python", BRIDGE_PY],
       {
-        env: { ...process.env, BLENDER_MCP_PORT: String(PORT) },
+        env: {
+          ...process.env,
+          BLENDER_MCP_PORT: String(PORT),
+          BLENDER_MCP_TOKEN: TOKEN,
+        },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
 
     this.proc.on("exit", (code, signal) => {
-      const err = new Error(`blender exited (code=${code}, signal=${signal})`);
+      const err = new Error(
+        `blender exited (code=${code}, signal=${signal}). stderr tail:\n${this.stderrBuf.slice(-2000)}`,
+      );
       for (const p of this.pending.values()) {
         clearTimeout(p.timer);
         p.reject(err);
       }
       this.pending.clear();
+      // Clear the response buffer so partial data from the dead session
+      // never bleeds into the next one (even though nextId is monotonic,
+      // a stale partial JSON line could confuse the parser).
+      this.buf = "";
       this.readyPromise = undefined;
       this.sock = undefined;
       this.proc = undefined;
@@ -151,29 +164,56 @@ export class BlenderBridge {
 
     await new Promise<void>((res, rej) => {
       const to = setTimeout(() => {
+        cleanup();
         rej(new Error(
           `blender startup timed out after ${STARTUP_TIMEOUT_MS}ms. stderr tail:\n${this.stderrBuf.slice(-2000)}`,
         ));
       }, STARTUP_TIMEOUT_MS);
+      // Accumulate into a buffer — the marker may straddle chunk boundaries.
+      let stdoutBuf = "";
       const onData = (chunk: Buffer) => {
-        const s = chunk.toString("utf8");
-        if (s.includes("BLENDER_MCP_READY")) {
-          this.proc!.stdout!.off("data", onData);
-          clearTimeout(to);
+        stdoutBuf += chunk.toString("utf8");
+        if (stdoutBuf.includes("BLENDER_MCP_READY")) {
+          cleanup();
           res();
         }
+        // Cap so a runaway Blender doesn't grow this unboundedly.
+        if (stdoutBuf.length > 65536) stdoutBuf = stdoutBuf.slice(-32768);
+      };
+      const onExit = () => {
+        cleanup();
+        rej(new Error(`blender exited during startup. stderr tail:\n${this.stderrBuf.slice(-2000)}`));
+      };
+      // Single teardown to ensure no listener leaks regardless of which path
+      // (ready / exit / timeout) settles the promise first.
+      const cleanup = () => {
+        clearTimeout(to);
+        this.proc!.stdout!.off("data", onData);
+        this.proc!.off("exit", onExit);
       };
       this.proc!.stdout!.on("data", onData);
-      this.proc!.once("exit", () => {
-        clearTimeout(to);
-        rej(new Error(`blender exited during startup. stderr tail:\n${this.stderrBuf.slice(-2000)}`));
-      });
+      this.proc!.once("exit", onExit);
     });
 
     this.sock = createConnection({ host: "127.0.0.1", port: PORT });
     await new Promise<void>((res, rej) => {
-      this.sock!.once("connect", () => res());
-      this.sock!.once("error", rej);
+      const onConn = () => {
+        this.sock!.off("error", onErr);
+        res();
+      };
+      const onErr = (e: Error) => {
+        this.sock!.off("connect", onConn);
+        // Kill the Blender proc so it doesn't stay orphaned when the TCP
+        // connect fails (e.g. port already in use, or server.py exited
+        // before binding). Without this, the proc accumulates on each retry.
+        if (this.proc) {
+          try { killProc(this.proc); } catch {}
+          this.proc = undefined;
+        }
+        rej(e);
+      };
+      this.sock!.once("connect", onConn);
+      this.sock!.once("error", onErr);
     });
     this.sock.setKeepAlive(true);
     this.sock.on("data", (chunk) => this.onData(chunk));
@@ -185,6 +225,13 @@ export class BlenderBridge {
       this.pending.clear();
       this.sock = undefined;
       this.readyPromise = undefined;
+      // Also tear down the proc — leaving a stale `proc` reference means
+      // the next ensure() short-circuits on `this.readyPromise` checks
+      // elsewhere and request timeouts try to kill an already-dead PID.
+      if (this.proc) {
+        try { killProc(this.proc); } catch {}
+        this.proc = undefined;
+      }
     };
     this.sock.on("error", onDisconnect);
     this.sock.on("close", (hadError) => {
@@ -192,42 +239,89 @@ export class BlenderBridge {
     });
   }
 
+  // Maximum bytes we'll buffer from blender before dropping. Protects
+  // against a runaway blender that emits huge JSON without a newline
+  // (e.g. an `execute` that returns megabytes of mesh data in one write).
+  private static readonly MAX_BUF = 64 * 1024 * 1024; // 64 MB
+
   private onData(chunk: Buffer) {
     this.buf += chunk.toString("utf8");
+    if (this.buf.length > BlenderBridge.MAX_BUF) {
+      // Drop the oversized buffer and reject all pending requests so the
+      // caller gets a clear error instead of silently hanging until timeout.
+      const err = new Error(
+        `blender response buffer overflow (>${BlenderBridge.MAX_BUF} bytes without newline)`,
+      );
+      for (const p of this.pending.values()) {
+        clearTimeout(p.timer);
+        p.reject(err);
+      }
+      this.pending.clear();
+      this.buf = "";
+      return;
+    }
     let nl: number;
     while ((nl = this.buf.indexOf("\n")) >= 0) {
       const line = this.buf.slice(0, nl);
       this.buf = this.buf.slice(nl + 1);
       if (!line.trim()) continue;
-      let resp: any;
+      let resp: { id?: number; ok?: boolean; result?: unknown; error?: string; traceback?: string };
       try {
-        resp = JSON.parse(line);
+        resp = JSON.parse(line) as typeof resp;
       } catch (e) {
+        process.stderr.write(`blender-mcp: bad json line: ${line.slice(0, 200)}\n`);
         continue;
       }
-      const id: number | undefined = resp.id;
-      if (id === undefined) continue;
+      const id: number | null | undefined = resp.id ?? null;
+      // server.py emits {"id": null, "ok": false, "error": ...} when it
+      // can't parse a request line. Without surfacing it, the bridge
+      // silently drops the diagnostic and the request hangs until timeout.
+      if (id == null) {
+        if (resp.error) {
+          process.stderr.write(`blender-mcp: server error (id=null): ${resp.error}\n`);
+        }
+        continue;
+      }
       const p = this.pending.get(id);
       if (!p) continue;
       this.pending.delete(id);
       clearTimeout(p.timer);
       if (resp.ok) p.resolve(resp.result);
-      else p.reject(new Error(resp.error + (resp.traceback ? `\n${resp.traceback}` : "")));
+      else p.reject(new Error((resp.error ?? "unknown error") + (resp.traceback ? `\n${resp.traceback}` : "")));
     }
   }
 
-  async send(action: string, params: Record<string, unknown> = {}): Promise<any> {
+  async send(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
     await this.ensure();
-    if (!this.sock) throw new Error("blender socket not connected");
+    // Snapshot before await/write — `this.sock` may be cleared by the
+    // disconnect handler between the null check and `.write`.
+    const sock = this.sock;
+    if (!sock) throw new Error("blender socket not connected");
     const id = this.nextId++;
-    const line = JSON.stringify({ id, action, params }) + "\n";
-    return new Promise<any>((res, rej) => {
+    // Token is attached as a top-level field; server.py validates before
+    // dispatching the action.
+    const line = JSON.stringify({ id, action, params, token: TOKEN }) + "\n";
+    return new Promise<unknown>((res, rej) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // The Blender process is still doing whatever it was doing (likely
+        // a long-running render). Kill it so the user doesn't end up with a
+        // zombie eating CPU/GPU; the next call will respawn.
+        if (this.proc) {
+          try { killProc(this.proc); } catch {}
+        }
+        // Mirror the exit handler — the proc.exit listener will eventually
+        // run, but rejecting here without clearing leaves a window where
+        // ensure() returns the stale readyPromise and send() writes to a
+        // dead socket.
+        this.pending.clear();
+        this.readyPromise = undefined;
+        this.sock = undefined;
+        this.proc = undefined;
         rej(new Error(`blender request timed out after ${REQUEST_TIMEOUT_MS}ms (action=${action})`));
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(id, { id, resolve: res, reject: rej, timer });
-      this.sock!.write(line, (err) => {
+      sock.write(line, (err) => {
         if (err) {
           this.pending.delete(id);
           clearTimeout(timer);
@@ -240,12 +334,18 @@ export class BlenderBridge {
   shutdown() {
     try { this.sock?.end(); } catch {}
     try { if (this.proc) killProc(this.proc); } catch {}
+    this.readyPromise = undefined;
   }
 }
 
 export const bridge = new BlenderBridge();
 
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+// SIGHUP doesn't exist on Windows — Node logs a warning ("Signal 'SIGHUP'
+// is not supported") if you try to register it there.
+const SIGNALS = process.platform === "win32"
+  ? (["SIGINT", "SIGTERM"] as const)
+  : (["SIGINT", "SIGTERM", "SIGHUP"] as const);
+for (const sig of SIGNALS) {
   process.on(sig, () => {
     bridge.shutdown();
     process.exit(0);
