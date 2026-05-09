@@ -39,11 +39,11 @@
 | `transform` | location / rotation_euler (rad) / scale を設定 |
 | `select` | 名前配列・all・none で選択状態を制御 |
 | `material` | Principled BSDF マテリアルを作成/更新（color, metallic, roughness） |
-| `render` | 現在のシーンをレンダリング（CYCLES / EEVEE_NEXT / WORKBENCH、解像度・サンプル数・カメラ・フレーム指定可） |
+| `render` | 現在のシーンをレンダリング（`CYCLES` / `BLENDER_EEVEE_NEXT` / `BLENDER_WORKBENCH`、解像度・サンプル数・カメラ・フレーム指定可） |
 | `import_file` / `export_file` | `.obj` / `.fbx` / `.glb` / `.gltf` / `.stl` / `.ply`（`.dae` は import のみ） |
 | `open` / `save` | `.blend` ファイルの読み込み / 保存 |
 | `reset` | ファクトリリセット（空シーン） |
-| `keyframe_insert` | 任意プロパティ (location / rotation_euler / scale / hide_* / 他 attr) にキーフレーム挿入。`value` で値を事前設定、`interpolation` で補間種別 (CONSTANT / LINEAR / BEZIER / SINE / QUAD / CUBIC / EXPO / CIRC / BACK / BOUNCE / ELASTIC 等) 指定可 |
+| `keyframe_insert` | 任意プロパティ (location / rotation_euler / scale / hide_* / 他 attr) にキーフレーム挿入。`value` で値を事前設定、`interpolation` で補間種別 (CONSTANT / LINEAR / BEZIER / SINE / QUAD / CUBIC / QUART / QUINT / EXPO / CIRC / BACK / BOUNCE / ELASTIC) 指定可 |
 | `keyframe_delete` | 特定 `frame` またはプロパティ全体のキーフレーム削除 |
 | `list_keyframes` | fcurves と各 keyframe_points (frame / value / interpolation) を列挙 |
 | `set_frame` | シーン現在フレームを設定 |
@@ -88,7 +88,7 @@ Blender 4.2 以降が必要。インストール先は自動検出する（Windo
 ### Claude Code に登録
 
 ```bash
-claude mcp add blender -- node C:/Users/user/Desktop/blender-mcp/dist/index.js
+claude mcp add blender -- node C:/Users/user/Desktop/_MCP/blender-mcp/dist/index.js
 ```
 
 ### 設定可能な環境変数
@@ -99,16 +99,29 @@ claude mcp add blender -- node C:/Users/user/Desktop/blender-mcp/dist/index.js
 | `BLENDER_MCP_PORT` | `54321` | 橋渡し用の localhost TCP ポート |
 | `BLENDER_STARTUP_TIMEOUT` | `60000` | Blender 起動タイムアウト (ms) |
 | `BLENDER_REQUEST_TIMEOUT` | `120000` | 単一リクエストのタイムアウト (ms) |
+| `BLENDER_MCP_WORKSPACE` | MCP サーバーの cwd（= 子プロセス Blender の cwd と同じ） | ファイル IO (render / import / export / open / save) を許可するルートディレクトリ。配下以外への書き込み・読み込みは拒否される |
+| `BLENDER_MCP_ALLOW_EXECUTE` | 未設定 | `1` を設定した場合のみ `execute` アクション (任意 Python 実行) を有効化。RCE リスクがあるため明示的なオプトインを要求 |
+| `BLENDER_MCP_DEBUG` | 未設定 | `1` でエラー応答に Python トレースバックを含める (ホストパスが漏れるため通常はオフ) |
+| `BLENDER_MCP_TOKEN` | 自動生成 (32 byte hex) | Bridge が起動毎に乱数生成して Blender 側に env で渡すワンタイム共有秘密。**手動で設定しないこと** — 設定すると Bridge ↔ Blender 間で値がずれて auth エラーになる |
+
+セキュリティ:
+
+- ループバック TCP ソケットはローカルプロセスから誰でも到達可能なので、**毎起動ごとに乱数トークン**を Bridge → Blender に env で渡し、リクエストごとに突き合わせている。トークンが無いと `auth` エラーで拒否される。
+- `--disable-autoexec` + `wm.open_mainfile(use_scripts=False)` で、悪意ある `.blend` の自動実行 Python による RCE を遮断する。
+- ファイル IO 系アクションは `BLENDER_MCP_WORKSPACE` 配下に限定（path traversal 防止）。
+- `execute` (任意 Python) は既定では無効。`BLENDER_MCP_ALLOW_EXECUTE=1` を明示する事で初めて有効化する。
 
 ### 呼び出し例
 
 シーン確認 → キューブ追加 → マテリアル設定 → レンダリング:
 
+> `output_path` はデフォルトで `BLENDER_MCP_WORKSPACE`（= 起動時の cwd）配下のみ許可される。workspace 外のパスは拒否されるので、`BLENDER_MCP_WORKSPACE` を適切に設定するか、workspace 配下のパスを使う事。
+
 ```json
 {"action": "scene"}
 {"action": "create", "primitive": "cube", "name": "Hero", "location": [0, 0, 1]}
 {"action": "material", "object": "Hero", "color": [0.8, 0.2, 0.2], "metallic": 0.3, "roughness": 0.4}
-{"action": "render", "output_path": "C:/tmp/out.png", "resolution_x": 1920, "resolution_y": 1080, "samples": 64, "engine": "CYCLES"}
+{"action": "render", "output_path": "/your/workspace/out.png", "resolution_x": 1920, "resolution_y": 1080, "samples": 64, "engine": "CYCLES"}
 ```
 
 キーフレームアニメーション (1 秒で真上に 5m 上昇):

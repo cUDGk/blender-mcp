@@ -97,7 +97,7 @@ function killProc(proc: ChildProcess): void {
 
 type Pending = {
   id: number;
-  resolve: (v: any) => void;
+  resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
 };

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { createRequire } from "node:module";
 import { z } from "zod";
 import { bridge } from "./bridge.js";
+
+// Single source of truth for the version string — duplicating it in
+// package.json and index.ts drifted when 0.2.x was bumped.
+const PKG = createRequire(import.meta.url)("../package.json") as { version: string };
 
 function textContent(data: unknown) {
   const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -72,7 +77,7 @@ const paramsSchema = z.union([z.record(z.any()), z.string()]);
 
 const server = new McpServer({
   name: "blender",
-  version: "0.2.1",
+  version: PKG.version,
 });
 
 server.tool(
@@ -126,55 +131,64 @@ Use 'scene' first to inspect state, then combine declarative actions (create/tra
       "cube","sphere","ico_sphere","plane","cone","cylinder","torus","monkey",
       "camera","light_point","light_sun","light_spot","light_area","empty",
     ]).optional().describe("Primitive kind (create)"),
-    name: z.string().optional().describe("Object name (delete/transform) or new name (create/material)"),
+    name: z.string().optional().describe("Per-action role: create=new object name; delete/transform=target object name; material=material name (the target object is given via `object`); add_modifier=modifier name (or omit to default to capitalized modifier_type — equivalent to passing modifier_name_new)"),
     names: namesSchema.optional().describe("Object names (select)"),
     all: z.boolean().optional().describe("Select all (select)"),
     none: z.boolean().optional().describe("Deselect all (select)"),
     location: vec3.optional().describe("[x,y,z] world location"),
     rotation_euler: vec3.optional().describe("[x,y,z] Euler rotation in radians"),
     scale: vec3.optional().describe("[x,y,z] scale"),
-    object: z.string().optional().describe("Target object name (material)"),
+    object: z.string().optional().describe("Target object name (used by: material, keyframe_insert, keyframe_delete, list_keyframes, add_modifier, remove_modifier, list_modifiers, camera_look_at)"),
     color: colorSchema.optional().describe("RGB or RGBA (0..1) base color (material)"),
     metallic: z.number().min(0).max(1).optional().describe("Metallic 0..1 (material)"),
     roughness: z.number().min(0).max(1).optional().describe("Roughness 0..1 (material)"),
     output_path: z.string().optional().describe("Absolute output path (render)"),
-    resolution_x: z.number().int().positive().optional().describe("Render width (render)"),
-    resolution_y: z.number().int().positive().optional().describe("Render height (render)"),
-    samples: z.number().int().positive().optional().describe("Render samples (render)"),
+    resolution_x: z.number().int().positive().max(8192).optional().describe("Render width (render), max 8192"),
+    resolution_y: z.number().int().positive().max(8192).optional().describe("Render height (render), max 8192"),
+    samples: z.number().int().positive().max(4096).optional().describe("Render samples (render), max 4096"),
     engine: z.enum(["CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_WORKBENCH"]).optional().describe("Render engine (render)"),
-    camera: z.string().optional().describe("Camera object name (render)"),
-    frame: z.number().int().optional().describe("Frame (render / keyframe_insert / keyframe_delete / set_frame)"),
-    path: z.string().optional().describe("File path (import_file/export_file/open/save)"),
+    camera: z.string().optional().describe("Camera object name (used by: render, camera_look_at)"),
+    frame: z.number().int().optional().describe("Frame number. Required by render / keyframe_insert / set_frame. Optional for keyframe_delete — omit to delete every keyframe of the property on this object."),
+    path: z.string().optional().describe("File path. import_file: .obj/.fbx/.glb/.gltf/.stl/.ply/.dae. export_file: .obj/.fbx/.glb/.gltf/.stl/.ply (no .dae — Blender export of Collada is not wired up here, import-only). open/save: .blend"),
     selection_only: z.boolean().optional().describe("Export only selected objects (export_file)"),
     property: z.string().optional().describe("keyframe_*: property (location/rotation_euler/scale/hide_viewport/...)"),
     value: z.any().optional().describe("keyframe_insert: new value to set before inserting"),
-    interpolation: z.enum(["CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART", "QUINT", "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC"]).optional().describe("keyframe_insert: set the last keyframe's interpolation"),
+    interpolation: z.enum(["CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART", "QUINT", "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC"]).optional().describe("keyframe_insert: interpolation for the keyframe at `frame`"),
     start: z.number().int().optional().describe("frame_range: scene.frame_start"),
     end: z.number().int().optional().describe("frame_range: scene.frame_end"),
     fps: z.number().int().optional().describe("frame_range: scene.render.fps"),
-    modifier_type: z.string().optional().describe("add_modifier: Blender modifier type (BEVEL/SUBSURF/ARRAY/SOLIDIFY/MIRROR/BOOLEAN/DECIMATE/WAVE/SMOOTH/SKIN/REMESH/SCREW/SHRINKWRAP/LATTICE/...)"),
-    modifier_name: z.string().optional().describe("remove_modifier: modifier name"),
-    params: paramsSchema.optional().describe("add_modifier: modifier attribute name→value (e.g. {levels: 2, render_levels: 3} for SUBSURF)"),
+    modifier_type: z.string().optional().describe("add_modifier: Blender modifier type (BEVEL/SUBSURF/ARRAY/SOLIDIFY/MIRROR/BOOLEAN/DECIMATE/WAVE/SMOOTH/SKIN/REMESH/SCREW/SHRINKWRAP/LATTICE/...). Case-insensitive — server normalizes to upper case."),
+    modifier_name: z.string().optional().describe("remove_modifier: modifier name to remove"),
+    modifier_name_new: z.string().optional().describe("add_modifier: name for the new modifier (defaults to capitalized modifier_type)"),
+    params: paramsSchema.optional().describe("add_modifier: modifier attribute name→value (e.g. {levels: 2, render_levels: 3} for SUBSURF). Keys must be lowercase identifiers ([a-z][a-z0-9_]*); non-conforming keys are blocked and returned in `rejected_params`. Unknown attribute names are returned in `unknown_params` (the modifier is still created)."),
     target: z.string().optional().describe("camera_look_at: target object name"),
-    track_axis: z.string().optional().describe("camera_look_at: track axis (default TRACK_NEGATIVE_Z)"),
-    up_axis: z.string().optional().describe("camera_look_at: up axis (default UP_Y)"),
+    track_axis: z.enum([
+      "TRACK_X", "TRACK_Y", "TRACK_Z",
+      "TRACK_NEGATIVE_X", "TRACK_NEGATIVE_Y", "TRACK_NEGATIVE_Z",
+    ]).optional().describe("camera_look_at: track axis (default TRACK_NEGATIVE_Z)"),
+    up_axis: z.enum(["UP_X", "UP_Y", "UP_Z"]).optional().describe("camera_look_at: up axis (default UP_Y)"),
   },
   async (params) => {
     const { action, ...rest } = params;
     try {
+      if (action === "execute" && !ALLOW_EXECUTE) {
+        return errContent(
+          "execute disabled; set BLENDER_MCP_ALLOW_EXECUTE=1 to enable arbitrary Python execution (RCE risk)",
+        );
+      }
       // object/array 型フィールドは文字列で届く可能性があるので coerceObject で戻す。
       // Python 側は dict/list を期待するので、文字列のままでは送らない。
       const normalized: Record<string, unknown> = { ...rest };
       const arrayKeys = ["names", "location", "rotation_euler", "scale", "color"] as const;
       for (const k of arrayKeys) {
         if (k in normalized) {
-          const coerced = coerceObject<unknown[]>(normalized[k]);
+          const coerced = coerceObject<unknown[]>(normalized[k], k);
           if (coerced === undefined) delete normalized[k];
           else normalized[k] = coerced;
         }
       }
       if ("params" in normalized) {
-        const coerced = coerceObject<Record<string, unknown>>(normalized.params);
+        const coerced = coerceObject<Record<string, unknown>>(normalized.params, "params");
         if (coerced === undefined) delete normalized.params;
         else normalized.params = coerced;
       }
